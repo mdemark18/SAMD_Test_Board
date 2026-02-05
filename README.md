@@ -17,7 +17,7 @@ This program stack is used to flash our Binary Counters that are using the ARM p
 
  ## Walkthrough
  - Ensure all software and cables are set up correctly.
- - Download all files in the [Tester](/tester) folder into one directory
+ - Download all files in the [Tester](/Tester) folder into one directory
  - Extract files
  - Run Tester.py
 
