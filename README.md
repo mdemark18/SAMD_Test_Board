@@ -26,3 +26,6 @@ This program stack is used to flash our Binary Counters that are using the ARM p
 - The tester is set up to download the firmware.hex on its own
 - It is CRUCIAL that all files downloaded are in the same directory
 - This should be relatively painless, any questions can be directed towards millerdemark@gmail.com
+
+## Other
+- Here is the [full file](https://github.com/mdemark18/SAMD-Binary-Counter) to flash the counter. 

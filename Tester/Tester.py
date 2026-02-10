@@ -1,90 +1,196 @@
 import subprocess
+import serial
+import serial.tools.list_ports
+import threading
+import time
+import shutil
 import sys
-import os
-import signal
+from pathlib import Path
+from queue import Queue, Empty
 
-# ---------------- CONFIG ----------------
-DEVICE = "ATSAMD21E18A"        # Workaround for E15B
-TOOL = "atmelice"
-INTERFACE = "swd"
-HEX_FILE = "firmware.hex"
-# ----------------------------------------
+# ----------------- CONFIG -----------------
+DEVICE = "ATSAMD21E18A"
+BASE_DIR = Path(__file__).resolve().parent
+HEX_FILE = BASE_DIR / "firmware.hex"
+BAUDRATE = 115200
+SERIAL_TIMEOUT = 1  # seconds
 
+# ----------------- FLASHING -----------------
+def flash():
+    print("\n=== FLASHING TARGET ===\n")
+    if not HEX_FILE.exists():
+        print("Firmware file not found:", HEX_FILE)
+        return False
 
-def run_flash():
-    if not os.path.exists(HEX_FILE):
-        print(f"[ERROR] HEX file not found: {HEX_FILE}")
-        return
+    # Try to find pymcuprog automatically
+    CMD_PATH = shutil.which("pymcuprog")
+    if CMD_PATH is None:
+        # Common Python Scripts folder fallback
+        possible_paths = [
+            Path(sys.executable).parent / "Scripts" / "pymcuprog.exe",
+            Path.home() / r"AppData\Local\Programs\Python\Python3\Scripts\pymcuprog.exe",
+            Path.home() / r"AppData\Local\Packages\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\LocalCache\local-packages\Python313\Scripts\pymcuprog.exe"
+        ]
+        for p in possible_paths:
+            if p.exists():
+                CMD_PATH = str(p)
+                break
+
+    if CMD_PATH is None:
+        print("Could not find pymcuprog.exe on this system.")
+        print("Please install it or provide the correct path.")
+        return False
+
+    print("Using pymcuprog at:", CMD_PATH)
 
     cmd = [
-        "pymcuprog",
+        CMD_PATH,
         "write",
-        "--tool", TOOL,
+        "--tool", "atmelice",
         "--device", DEVICE,
-        "--interface", INTERFACE,
+        "--interface", "swd",
         "--erase",
         "--verify",
-        "--file", HEX_FILE
+        "--file", str(HEX_FILE)
     ]
 
-    print("\nStarting ATSAMD21 flashing process...")
-    print("Running:")
-    print(" ".join(cmd))
-    print("-" * 60)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            print(line.strip())
+        proc.wait()
+        if proc.returncode == 0:
+            print("\nFLASH SUCCESS\n")
+            return True
+        else:
+            print("\nFLASH FAILED\n")
+            return False
+    except Exception as e:
+        print("Error running flash:", e)
+        return False
+# ----------------- PORT DETECTION -----------------
+def detect_ports(timeout=10):
+    print("\nWaiting for serial ports to appear...\n")
+    start = time.time()
+
+    while time.time() - start < timeout:
+        target = None
+        arduino = None
+        ports = serial.tools.list_ports.comports()
+
+        for p in ports:
+            desc = p.description.lower()
+            print(f"  {p.device} -> {p.description}")
+
+            if "arduino" in desc:
+                arduino = p.device
+
+            if "communication device class asf example" in desc:
+                target = p.device
+
+        if target and arduino:
+            print("\nPorts detected!")
+            return target, arduino
+
+        print("Waiting for device enumeration...\n")
+        time.sleep(1)
+
+    print("\nTimed out waiting for ports.")
+    return None, None
+
+# ----------------- SERIAL READER -----------------
+def read_serial_lines(ser, queue):
+    """Continuously read serial lines into a queue."""
+    while ser.is_open:
+        try:
+            line = ser.readline().decode(errors="ignore").strip()
+            if line:
+                queue.put(line)
+        except Exception:
+            break
+
+# ----------------- RUN TEST -----------------
+def run_test(flash_first=True):
+    if flash_first:
+        if not flash():
+            print("Flash failed, aborting test.")
+            return
+
+    print("Detecting devices...")
+    target_port, arduino_port = detect_ports()
+    if not target_port or not arduino_port:
+        print("Devices not found.")
+        return
 
     try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-
-        # Stream output live to terminal
-        for line in process.stdout:
-            print(line, end="")
-
-        process.wait()
-
-        if process.returncode == 0:
-            print("\n[SUCCESS] Flashing completed successfully.")
-        else:
-            print(f"\n[ERROR] Flashing failed with code {process.returncode}")
-
-    except FileNotFoundError:
-        print("[ERROR] pymcuprog not found. Is it installed and in PATH?")
+        target_ser = serial.Serial(target_port, BAUDRATE, timeout=SERIAL_TIMEOUT)
+        arduino_ser = serial.Serial(arduino_port, BAUDRATE, timeout=SERIAL_TIMEOUT)
     except Exception as e:
-        print(f"[ERROR] {e}")
+        print("Failed to open serial ports:", e)
+        return
+
+    time.sleep(2)  # give devices time to reset
+
+    # Queue to store lines from Arduino
+    arduino_queue = Queue()
+    arduino_thread = threading.Thread(target=read_serial_lines, args=(arduino_ser, arduino_queue), daemon=True)
+    arduino_thread.start()
+
+    # --- Send DEBUG command ---
+    print("\n=== DEBUG MODE STARTED ===")
+    arduino_ser.write(b"DEBUG\n")
+    target_ser.write(b"DEBUG\n")
+
+    # --- Collect Arduino output until end ---
+    arduino_lines = []
+    while True:
+        try:
+            line = arduino_queue.get(timeout=0.1)
+            print("[ARDUINO]", line)
+            arduino_lines.append(line)
+            if "End of Test." in line:
+                break
+        except Empty:
+            continue
+
+    print("\n=== DEBUG COMPLETE ===")
+    print("=== FINAL SUMMARY ===")
+    for line in arduino_lines:
+        print("[ARDUINO]", line)
+
+    # Cleanup
+    arduino_ser.close()
+    target_ser.close()
+    print("\nTest session finished.\n")
 
 
+# ----------------- TERMINAL UI -----------------
 def main():
-    print("==============================================")
-    print(" ATSAMD21 Programming Utility")
-    print(" Tool: Atmel-ICE + pymcuprog")
-    print("==============================================")
+    print("\n=== SAMD Hardware Tester ===\n")
+    print("Firmware file:", HEX_FILE)
 
     while True:
-        print("\nOptions:")
-        print("  F  - Flash firmware")
-        print("  Q  - Quit")
-        print("----------------------------------------------")
+        try:
+            cmd = input(
+                "\nCommands:\n"
+                "  run   → flash + test\n"
+                "  again → test only (no flash)\n"
+                "  exit  → quit\n\n> "
+            ).strip().lower()
 
-        choice = input("Enter choice: ").strip().upper()
+            if cmd == "run":
+                run_test(flash_first=True)
+            elif cmd == "again":
+                run_test(flash_first=False)
+            elif cmd == "exit":
+                print("\nExiting tester...")
+                break
+            else:
+                print("Unknown command.")
 
-        if choice == "F":
-            run_flash()
-        elif choice == "Q":
-            print("Exiting program.")
-            break
-        else:
-            print("Invalid option.")
+        except KeyboardInterrupt:
+            print("\n(Interrupted — tester still running)")
 
-
-def handle_ctrl_c(sig, frame):
-    print("\nCtrl+C detected. Exiting safely.")
-    sys.exit(0)
-
-
+# ----------------- ENTRY POINT -----------------
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, handle_ctrl_c)
     main()
